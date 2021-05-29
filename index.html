@@ -1,0 +1,428 @@
+<html>
+
+<head>
+    <meta charset="UTF-8">
+    <link href="styles.css" rel="stylesheet" />
+</head>
+
+<body>
+    <div id="midi-dev-select">
+        Midi input device:
+        <select id="midi-inputs"></select>
+        <br />
+        Midi output device:
+        <select id="midi-outputs"></select>
+        <br />
+        <button onclick="start()">Select devices</button>
+    </div>
+    <div id="main-container" style="display: none;">
+        <div>
+            <h1>General</h1>
+            Tempo (BPM) <input id="tempo" value="120" type="number" />
+            <button onclick="tempo = Number(document.getElementById('tempo').value)">Set tempo</button>
+            <br />
+            <button onclick="toggleMetronome()">Toggle metronome (M)</button>
+            <br />
+            <input type="checkbox" id="route-input-to-output" onchange="routeInputToOutput=this.checked" />
+            Route MIDI input to output
+        </div>
+        <div>
+            <h1>Synth settings</h1>
+            <button onclick="panic()">Panic</button>
+            <br />
+            Sound:
+            <select id="synth-sound">
+                <option value="sine">Sine</option>
+                <option value="saw">Saw</option>
+                <option value="sub" selected>Pluck</option>
+            </select>
+            <br />
+            Volume (dB): <input id="synth-volume" value="-6" step="3" type="number" />
+            <br />
+            Voice limit (0 = no limit):
+            <input id="synth-voice-lim" value="0" type="number" />
+            <br />
+            <button onclick="setSynthSettings()">Set synth settings</button>
+            <br />
+            <button onclick="setDelay(true)">Enable delay (U)</button>
+            <button onclick="setDelay(false)">Disable delay (I)</button>
+        </div>
+        <div>
+            <h1>Recording</h1>
+            <button onclick="toggleRecording()">Start / stop recording (R)</button> <span id="rec-status">🔊</span>
+        </div>
+        <div>
+            <h1>Playback</h1>
+            <h2>Playlist</h2>
+            <input type="checkbox" checked="true" id="use-divs"> Use divisions instead of milliseconds
+            <br />
+            <input type="checkbox" id="use-hex"> Use hex values for divisions
+            <br />
+            <pre>
+bar  0                                               | 1
+step 00 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 | 00 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15
+hex  00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F | 10 11 12 13 14 15 16 17 18 19 2A 2B 2C 2D 2E 2F
+.....^...........^...........^...........^...........|.^...........^...........^...........^...........
+            </pre>
+            Hilight
+            <select id="hilight">
+                <option value="">Hilight off</option>
+                <option value="on">Note on</option>
+                <option value="off">Note off</option>
+            </select>
+            <br />
+            <textarea id="playlist" rows="20" cols="80"></textarea>
+            <br />
+            <button onclick="serializePlaylist();renderPlaylist()">Render</button>
+            <button onclick="quantize()">Quantize</button>
+            <button onclick="shiftNotes()">Shift</button>
+            <button onclick="transponeNotes()">Transpone</button>
+            <button onclick="playlist=[];renderPlaylist()">Clear playlist</button>
+            <button onclick="saveProject()">Save project</button>
+            <h2>Play MIDI</h2>
+            Output destination
+            <select id="midi-destination">
+                <option value="midi">MIDI device</option>
+                <option value="local">Local synth</option>
+                <option value="midi,local">MIDI device and local synth</option>
+            </select>
+            Local synth channel <input id="local-synth-channel" type="number" value="1" />
+            <br/>
+            <button onclick="playbackMidi(true)">Start playback (S)</button>
+            <button onclick="playbackMidi(false)">Stop playback (T)</button>
+        </div>
+    </div>
+
+    <script src="midi.js"></script>
+    <script>
+        let synth
+        let midiInput, midiOutput
+        let tempo = 120
+        let routeInputToOutput
+
+        const localStorageKey = 'MIDI-RECORD-0ca4618a-c455-42fb-a298-5b54dca4295d-v1'
+
+        const sendSynthMsg = (type, param, param2) => {
+            const synthMessageTypes = {
+                NoteOn: 1,
+                NoteOff: 2,
+                KillAll: 3,
+                SetSynth: 4,
+                SetVolume: 5,
+                SetVoiceLimit: 6,
+                SetDelay: 7
+            }
+            synth.port.postMessage([synthMessageTypes[type], param, param2])
+        }
+
+        const devices = new MidiDeviceList()
+        const start = async () => {
+            midiInput = devices.getDevice('input', document.getElementById('midi-inputs').value)
+            midiOutput = devices.getDevice('output', document.getElementById('midi-outputs').value)
+
+            document.getElementById('midi-dev-select').style.display = 'none'
+            document.getElementById('main-container').style.display = 'initial'
+
+            addKeyListeners()
+
+            const audioCtx = new AudioContext({
+                latencyHint: 'interactive'
+            })
+            await audioCtx.audioWorklet.addModule('synth.js')
+            synth = new AudioWorkletNode(audioCtx, 'BasicSynth')
+            await synth.connect(audioCtx.destination)
+
+            setSynthSettings()
+
+            midiInput.onNoteOn = (channel, note, velocity) => {
+                sendSynthMsg('NoteOn', note)
+                record(['NoteOn', note])
+                if (routeInputToOutput) {
+                    midiOutput.noteOn(note, 0, 127)
+                }
+            }
+
+            midiInput.onNoteOff = (channel, note) => {
+                sendSynthMsg('NoteOff', note)
+                record(['NoteOff', note])
+                if (routeInputToOutput) {
+                    midiOutput.noteOff(note, 0)
+                }
+            }
+        }
+
+        const initMidiDevList = async () => {
+            await devices.init()
+            const populateMidiDeviceSelect = (id, devs) => {
+                devs.forEach(x => {
+                    document.getElementById(id).innerHTML +=
+                        `<option value="${x.id}">${x.name}</option>`
+                })
+            }
+
+            populateMidiDeviceSelect('midi-inputs', devices.getInputs())
+            populateMidiDeviceSelect('midi-outputs', devices.getOutputs())
+
+            tryLoadProject()
+        }
+
+        initMidiDevList()
+
+        const panic = () => sendSynthMsg('KillAll')
+
+        const setSynthSettings = () => {
+            sendSynthMsg('SetSynth', document.getElementById('synth-sound').value)
+            let volume = Number(document.getElementById('synth-volume').value)
+            volume = Math.pow(10, volume / 20)
+            if (volume > 1) volume = 1
+            sendSynthMsg('SetVolume', volume)
+            const lim = Number(document.getElementById('synth-voice-lim').value)
+            if (lim < 0) lim = 0
+            sendSynthMsg('SetVoiceLimit', lim)
+        }
+
+        const setDelay = enabled => {
+            let param
+            if (enabled) {
+                const time = 60 / tempo / 4 * 3
+                const feedback = Math.pow(10, -9 / 20)
+                const mix = Math.pow(10, -9 / 20)
+                param = { time, feedback, mix }
+            }
+            sendSynthMsg('SetDelay', param)
+        }
+
+        let recording
+
+        let metronomeInterval
+
+        let playlist = []
+        let recordingStarted
+        const record = (event, note) => {
+            if (recording) {
+                playlist[playlist.length - 1].push({ time: Date.now() - recordingStarted, event })
+            }
+        }
+
+        const toggleRecording = () => {
+            recording = !recording
+            if (recording) {
+                playlist.push([{ time: 0, event: ['Channel', 1] }])
+                recordingStarted = Date.now()
+                if (metronomeInterval) {
+                    toggleMetronome()
+                }
+                toggleMetronome()
+            } else {
+                if (metronomeInterval) {
+                    toggleMetronome()
+                }
+                renderPlaylist()
+            }
+            document.getElementById('rec-status').innerText = recording ? '🎹' : '🔊'
+        }
+
+        const toggleMetronome = () => {
+            if (metronomeInterval) {
+                clearInterval(metronomeInterval)
+                metronomeInterval = undefined
+            } else {
+                const metronome = () => {
+                    sendSynthMsg('NoteOn', 1000, 'noise')
+                    setTimeout(() => sendSynthMsg('NoteOff', 1000), 50)
+                }
+                metronomeInterval = setInterval(metronome, (60 / tempo) * 1000)
+                metronome()
+            }
+        }
+
+        const msToDiv = ms => Math.round(ms / 60 * tempo * 16) / 1000
+        const divToMs = div => div * 1000 * 60 / (tempo * 16)
+
+        const renderPlaylist = () => {
+            let s = ''
+            const hilightValue = document.getElementById('hilight').value
+            playlist.forEach((list, i) => {
+                s += `\n# Playlist ${i + 1}\n`
+                list.forEach(x => {
+                    let line = ''
+                    if (!document.getElementById('use-divs').checked) {
+                        line += `${(x.time.toString() + '          ').substr(0, 10)}; `
+                    } else {
+                        let tm = msToDiv(x.time)
+                        if (document.getElementById('use-hex').checked && Math.floor(tm) === tm) {
+                            tm = 'h' + tm.toString(16).toUpperCase()
+                        }
+                        line += `${(tm.toString() + '          ').substr(0, 10)}; `
+                    }
+                    if (x.event[0] === 'Channel') {
+                        line += `channel ${x.event[1]}\n`
+                    }
+                    if (x.event[0] === 'NoteOn') {
+                        if (hilightValue === 'on') line = '> ' + line
+                        line += `on ${x.event[1]}\n`
+                    }
+                    if (x.event[0] === 'NoteOff') {
+                        if (hilightValue === 'off') line = '> ' + line
+                        line += `off ${x.event[1]}\n`
+                    }
+                    s += line
+                })
+            })
+            document.getElementById('playlist').value = s
+        }
+
+        const serializePlaylist = () => {
+            const useDivs = document.getElementById('use-divs').checked
+            playlist = []
+            const s = document.getElementById('playlist').value
+                .replace(/>/g, '')
+                .split('\n').map(x => x.trim()).filter(Boolean)
+            s.forEach(line => {
+                if (line[0] === '#') {
+                    playlist.push([])
+                    return
+                }
+                line = line.split(';')
+                let time = Number(line[0])
+                if (useDivs || line[0][0] === 'h') {
+                    if (line[0][0] === 'h') time = Number.parseInt(line[0].substr(1), 16)
+                    time = divToMs(time)
+                }
+                let [cmd, val] = line[1].trim().split(' ')
+                val = Number(val)
+                if (cmd === 'channel') cmd = 'Channel'
+                if (cmd === 'on') cmd = 'NoteOn'
+                if (cmd === 'off') cmd = 'NoteOff'
+                playlist[playlist.length - 1].push({ time, event: [cmd, val] })
+            })
+        }
+
+        const quantize = () => {
+            serializePlaylist()
+            playlist.forEach(list => {
+                list.forEach(data => {
+                    data.time = divToMs(Math.round(msToDiv(data.time)))
+                })
+            })
+            renderPlaylist()
+        }
+
+        const shiftNotes = () => {
+            const params = prompt('Shift playlist number and amount (e.g. "1,-64")', '1,-64')
+            if (params) {
+                const [pidx, amt] = params.split(',').map(Number)
+                serializePlaylist()
+                playlist[pidx - 1].forEach(x => {
+                    x.time = x.time + divToMs(amt)
+                })
+                renderPlaylist()
+            }
+        }
+
+        const transponeNotes = () => {
+            const params = prompt('Transpone playlist number and amount (e.g. "1,12" for +1 octave on playlist 1)', '1,12')
+            if (params) {
+                const [pidx, amt] = params.split(',').map(Number)
+                serializePlaylist()
+                playlist[pidx - 1].forEach(x => {
+                    if (x.event[0] === 'NoteOn' || x.event[0] === 'NoteOff') {
+                        x.event[1] = x.event[1] + amt
+                    }
+                })
+                renderPlaylist()
+            }
+
+        }
+
+        let playlistTimeouts = []
+        let playlistChannels = []
+
+        const playbackMidi = enabled => {
+            if (recording) return
+
+            const playbackDest = document.getElementById('midi-destination').value.split(',')
+            const enableLocalPlayback = playbackDest.includes('local')
+            const enableMidiPlayback = playbackDest.includes('midi')
+
+            const localSynthChannel = Number(document.getElementById('local-synth-channel').value) - 1
+
+            playlistTimeouts.forEach(clearTimeout)
+            if (enabled) {
+                serializePlaylist()
+                playlistChannels = []
+                playlist.forEach((list, i) => {
+                    playlistChannels.push(0)
+                    list.forEach(x => {
+                        const playlistIdx = i
+                        let fn
+                        if (x.event[0] === 'Channel') {
+                            fn = () => playlistChannels[playlistIdx] = x.event[1] - 1
+                        }
+                        if (x.event[0] === 'NoteOn') {
+                            fn = () => {
+                                if (enableMidiPlayback)
+                                    midiOutput.noteOn(x.event[1], playlistChannels[playlistIdx], 127)
+                                if (enableLocalPlayback && playlistChannels[playlistIdx] === localSynthChannel) {
+                                    sendSynthMsg('NoteOn', x.event[1])
+                                }
+                            }
+                        }
+                        if (x.event[0] === 'NoteOff') {
+                            fn = () => {
+                                midiOutput.noteOff(x.event[1], playlistChannels[playlistIdx])
+                                if (enableLocalPlayback && playlistChannels[playlistIdx] === localSynthChannel) {
+                                    sendSynthMsg('NoteOff', x.event[1])
+                                }
+                            }
+                        }
+                        if (fn) {
+                            playlistTimeouts.push(setTimeout(fn, x.time))
+                        }
+                    })
+                })
+            }
+        }
+
+        const addKeyListeners = () => {
+            document.addEventListener('keydown', event => {
+                let handled = true
+                if (event.code === 'KeyR') toggleRecording()
+                else if (event.code === 'KeyM') toggleMetronome()
+                else if (event.code === 'KeyU') setDelay(true)
+                else if (event.code === 'KeyI') setDelay(false)
+                else if (event.code === 'KeyS') playbackMidi(true)
+                else if (event.code === 'KeyT') playbackMidi(false)
+                else handled = false
+                if (handled) event.preventDefault()
+            })
+        }
+
+
+        const tryLoadProject = () => {
+            const saved = localStorage.getItem(localStorageKey)
+            if (saved) {
+                const data = JSON.parse(saved)
+                playlist = data.playlist
+                tempo = data.tempo
+                document.getElementById('midi-inputs').value = data.midi.in
+                document.getElementById('midi-outputs').value = data.midi.out
+                renderPlaylist()
+            }
+        }
+
+        const saveProject = () => {
+            const data = {
+                playlist, tempo,
+                midi: {
+                    in: document.getElementById('midi-inputs').value,
+                    out: document.getElementById('midi-outputs').value
+                }
+            }
+            localStorage.setItem(localStorageKey, JSON.stringify(data))
+        }
+
+    </script>
+</body>
+
+</html>
